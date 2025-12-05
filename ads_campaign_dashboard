@@ -1,0 +1,350 @@
+-- =============================================================================
+-- Campaign Dashboard V4 - Student Funnel Refinement
+-- =============================================================================
+-- Purpose: Campaign performance with trial → student funnel tracking
+-- Output:  GLS_Test.ads_campaign_dashboard_V4_student_refined
+-- =============================================================================
+
+CREATE OR REPLACE VIEW `taoist-data-studio.GLS_Test.ads_campaign_dashboard` AS
+
+WITH
+-- Advertising performance aggregated by campaign AND DATE
+advertising_performance AS (
+  SELECT
+    platform,
+    platform_display_name,
+    campaign_id,
+    campaign_name,
+    ad_date,
+    utm_campaign,
+    SUM(impressions) AS impressions,
+    SUM(clicks) AS clicks,
+    SUM(spend) AS spend,
+    SUM(conversions) AS ad_conversions,
+    SUM(conversion_value) AS ad_conversion_value,
+    CASE WHEN SUM(impressions) > 0 THEN SUM(clicks) / SUM(impressions) ELSE 0 END AS ctr,
+    CASE WHEN SUM(clicks) > 0 THEN SUM(spend) / SUM(clicks) ELSE 0 END AS cpc,
+    CASE WHEN SUM(impressions) > 0 THEN SUM(spend) / SUM(impressions) * 1000 ELSE 0 END AS cpm
+  FROM `taoist-data-studio.GLS_Test.ads_perf_daily`
+  GROUP BY platform, platform_display_name, campaign_id, campaign_name, ad_date, utm_campaign
+),
+
+-- Campaign name to ID mapping (for text campaign names)
+campaign_name_to_id_mapping AS (
+  SELECT DISTINCT
+    TRIM(CAST(campaign_id AS STRING)) AS campaign_id,
+    TRIM(UPPER(campaign_name)) AS campaign_name_upper
+  FROM `taoist-data-studio.google_ads.ads_Campaign_4189852833`
+  WHERE campaign_name IS NOT NULL
+
+  UNION DISTINCT
+
+  SELECT DISTINCT
+    TRIM(campaign_id) AS campaign_id,
+    TRIM(UPPER(campaign_name)) AS campaign_name_upper
+  FROM `taoist-data-studio.facebook_ads_prod.campaign_dimensions_act_940588709686807`
+  WHERE campaign_name IS NOT NULL
+),
+
+-- Orders with attribution data (including $0 trials)
+customer_orders AS (
+  SELECT
+    DATE(o.order_date) AS order_date,
+    o.customer_id,
+    c.email AS customer_email,
+    o.id AS order_id,
+    o.total / 100.0 AS total_revenue,
+    TRIM(CAST(o.utm_parameters.campaign AS STRING)) AS campaign_id_original,
+    COALESCE(
+      CASE WHEN REGEXP_CONTAINS(TRIM(CAST(o.utm_parameters.campaign AS STRING)), r'^\d+$')
+        THEN TRIM(CAST(o.utm_parameters.campaign AS STRING))
+        ELSE NULL
+      END,
+      cnm.campaign_id,
+      TRIM(CAST(o.utm_parameters.campaign AS STRING))
+    ) AS campaign_id,
+    CASE WHEN o.total = 0 THEN 1 ELSE 0 END AS is_trial,
+    CASE
+      WHEN ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.order_date) = 1 THEN 'New Customer'
+      ELSE 'Returning Customer'
+    END AS customer_type
+  FROM `taoist-data-studio.samcart_raw.orders` o
+  LEFT JOIN `taoist-data-studio.samcart_raw.customers` c
+    ON o.customer_id = c.id
+  LEFT JOIN campaign_name_to_id_mapping cnm
+    ON (
+      -- Exact match (preferred - safest)
+      TRIM(UPPER(CAST(o.utm_parameters.campaign AS STRING))) = cnm.campaign_name_upper
+      -- OR partial match: order campaign name contained in Meta campaign name
+      -- Safety: Only match if order name is >= 10 chars to reduce false positives
+      OR (
+        cnm.campaign_name_upper LIKE CONCAT('%', TRIM(UPPER(CAST(o.utm_parameters.campaign AS STRING))), '%')
+        AND LENGTH(TRIM(UPPER(CAST(o.utm_parameters.campaign AS STRING)))) >= 10
+      )
+    )
+  WHERE o.test_mode = FALSE
+    AND o.utm_parameters.campaign IS NOT NULL
+),
+
+-- Earliest order attribution (first touch) per customer
+customer_first_order_attribution AS (
+  SELECT
+    o.customer_id,
+    COALESCE(
+      CASE WHEN REGEXP_CONTAINS(TRIM(CAST(o.utm_parameters.campaign AS STRING)), r'^\d+$')
+        THEN TRIM(CAST(o.utm_parameters.campaign AS STRING))
+        ELSE NULL
+      END,
+      cnm.campaign_id,
+      TRIM(CAST(o.utm_parameters.campaign AS STRING))
+    ) AS first_order_campaign_id,
+    DATE(o.order_date) AS first_order_date
+  FROM `taoist-data-studio.samcart_raw.orders` o
+  LEFT JOIN campaign_name_to_id_mapping cnm
+    ON (
+      -- Exact match (preferred - safest)
+      TRIM(UPPER(CAST(o.utm_parameters.campaign AS STRING))) = cnm.campaign_name_upper
+      -- OR partial match: order campaign name contained in Meta campaign name
+      -- Safety: Only match if order name is >= 10 chars to reduce false positives
+      OR (
+        cnm.campaign_name_upper LIKE CONCAT('%', TRIM(UPPER(CAST(o.utm_parameters.campaign AS STRING))), '%')
+        AND LENGTH(TRIM(UPPER(CAST(o.utm_parameters.campaign AS STRING)))) >= 10
+      )
+    )
+  WHERE o.test_mode = FALSE
+    AND o.utm_parameters.campaign IS NOT NULL
+  QUALIFY ROW_NUMBER() OVER (PARTITION BY o.customer_id ORDER BY o.order_date) = 1
+),
+
+-- Trials, orders, and revenue aggregated per campaign/date
+aggregated_orders_by_date AS (
+  SELECT
+    order_date,
+    TRIM(CAST(campaign_id AS STRING)) AS campaign_id,
+    COUNT(DISTINCT CASE WHEN is_trial = 1 THEN order_id END) AS trials,
+    COUNT(order_id) AS attributed_orders,
+    SUM(total_revenue) AS revenue_for_date
+  FROM customer_orders
+  GROUP BY order_date, TRIM(CAST(campaign_id AS STRING))
+),
+
+-- Lifetime customer + revenue metrics per campaign
+aggregated_orders_lifetime AS (
+  SELECT
+    TRIM(CAST(campaign_id AS STRING)) AS campaign_id,
+    COUNT(DISTINCT customer_email) AS customer_emails,
+    COUNT(DISTINCT CASE WHEN customer_type = 'New Customer' THEN customer_id END) AS new_customers,
+    SUM(total_revenue) AS attributed_revenue,
+    COUNT(order_id) AS total_orders
+  FROM customer_orders
+  GROUP BY TRIM(CAST(campaign_id AS STRING))
+),
+
+-- Student activation dates (first active subscription start per customer)
+student_activation_dates AS (
+  SELECT
+    customer_id,
+    DATE(start_date) AS student_start_date
+  FROM (
+    SELECT
+      customer_id,
+      start_date,
+      ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY start_date) AS rn
+    FROM `taoist-data-studio.samcart_raw.subscriptions`
+    WHERE test_mode = FALSE
+      AND status = 'active'
+      AND start_date IS NOT NULL
+  )
+  WHERE rn = 1
+),
+
+-- Student events tied back to campaign of the first order
+student_events AS (
+  SELECT
+    TRIM(CAST(cfoa.first_order_campaign_id AS STRING)) AS campaign_id,
+    sad.student_start_date AS student_date,
+    sad.customer_id
+  FROM student_activation_dates sad
+  INNER JOIN customer_first_order_attribution cfoa
+    ON sad.customer_id = cfoa.customer_id
+  WHERE cfoa.first_order_campaign_id IS NOT NULL
+),
+
+students_by_campaign_date AS (
+  SELECT
+    student_date,
+    campaign_id,
+    COUNT(DISTINCT customer_id) AS students
+  FROM student_events
+  GROUP BY student_date, campaign_id
+),
+
+students_lifetime AS (
+  SELECT
+    campaign_id,
+    COUNT(DISTINCT customer_id) AS total_students
+  FROM student_events
+  GROUP BY campaign_id
+),
+
+-- All campaign/date combinations coming from ads, orders, and student activations
+all_campaign_dates AS (
+  SELECT DISTINCT
+    TRIM(CAST(campaign_id AS STRING)) AS campaign_id,
+    ad_date AS report_date
+  FROM `taoist-data-studio.GLS_Test.ads_perf_daily`
+
+  UNION DISTINCT
+
+  SELECT DISTINCT
+    TRIM(CAST(campaign_id AS STRING)) AS campaign_id,
+    order_date AS report_date
+  FROM customer_orders
+  WHERE campaign_id IS NOT NULL
+
+  UNION DISTINCT
+
+  SELECT DISTINCT
+    campaign_id,
+    student_date AS report_date
+  FROM students_by_campaign_date
+),
+
+-- Campaign metadata (prefer ads, fallback to orders)
+ads_campaign_metadata AS (
+  SELECT
+    TRIM(CAST(campaign_id AS STRING)) AS campaign_id,
+    ANY_VALUE(platform_display_name) AS platform_display_name,
+    ANY_VALUE(campaign_name) AS campaign_name,
+    ANY_VALUE(platform) AS platform
+  FROM `taoist-data-studio.GLS_Test.ads_perf_daily`
+  GROUP BY 1
+),
+
+order_campaign_ids AS (
+  SELECT DISTINCT TRIM(CAST(campaign_id AS STRING)) AS campaign_id
+  FROM customer_orders
+  WHERE campaign_id IS NOT NULL
+),
+
+campaign_metadata AS (
+  SELECT
+    oc.campaign_id,
+    COALESCE(acm.platform_display_name, 'Unknown') AS platform_display_name,
+    COALESCE(acm.campaign_name, oc.campaign_id) AS campaign_name,
+    COALESCE(acm.platform, 'unknown') AS platform
+  FROM order_campaign_ids oc
+  LEFT JOIN ads_campaign_metadata acm
+    ON oc.campaign_id = acm.campaign_id
+
+  UNION DISTINCT
+
+  SELECT
+    campaign_id,
+    platform_display_name,
+    campaign_name,
+    platform
+  FROM ads_campaign_metadata
+  WHERE campaign_id NOT IN (SELECT campaign_id FROM order_campaign_ids)
+),
+
+campaign_first_date AS (
+  SELECT
+    campaign_id,
+    MIN(report_date) AS first_date
+  FROM all_campaign_dates
+  GROUP BY campaign_id
+),
+
+-- Final assembly: combine ad, order, and student metrics
+final AS (
+  SELECT
+    acd.report_date AS ad_date,
+    acd.campaign_id,
+    COALESCE(cm.platform_display_name, 'Unknown') AS platform_display_name,
+    COALESCE(cm.campaign_name, acd.campaign_id) AS campaign_name,
+    COALESCE(ap.impressions, 0) AS impressions,
+    COALESCE(ap.clicks, 0) AS clicks,
+    COALESCE(ap.spend, 0) AS spend,
+  COALESCE(ap.ctr, 0) AS ctr,
+    COALESCE(ap.cpc, 0) AS cpc,
+    COALESCE(ao.trials, 0) AS trials,
+    COALESCE(scd.students, 0) AS students,
+    CASE
+      WHEN acd.report_date = cfd.first_date THEN COALESCE(aol.customer_emails, 0)
+      ELSE 0
+    END AS customer_emails,
+    CASE
+      WHEN acd.report_date = cfd.first_date THEN COALESCE(aol.new_customers, 0)
+      ELSE 0
+    END AS new_customers,
+    CASE
+      WHEN acd.report_date = cfd.first_date THEN COALESCE(slt.total_students, 0)
+      ELSE 0
+    END AS student_lifetime_total,
+    COALESCE(ao.revenue_for_date, 0) AS attributed_revenue,
+    COALESCE(ao.attributed_orders, 0) AS attributed_orders,
+    CASE
+      WHEN COALESCE(aol.new_customers, 0) > 0 AND COALESCE(ap.spend, 0) > 0
+        THEN ap.spend / aol.new_customers
+      ELSE 0
+    END AS cac,
+    CASE
+      WHEN COALESCE(ap.spend, 0) > 0 THEN COALESCE(ao.revenue_for_date, 0) / ap.spend
+      WHEN COALESCE(ao.revenue_for_date, 0) > 0 AND COALESCE(ap.spend, 0) = 0 THEN NULL
+      ELSE 0
+    END AS roas,
+    CASE
+      WHEN COALESCE(ao.trials, 0) > 0 AND COALESCE(ap.spend, 0) > 0
+        THEN ap.spend / ao.trials
+      ELSE 0
+    END AS cost_per_trial,
+    CASE
+      WHEN COALESCE(slt.total_students, 0) > 0 AND COALESCE(ap.spend, 0) > 0
+        THEN ap.spend / slt.total_students
+      ELSE 0
+    END AS cost_per_student
+  FROM all_campaign_dates acd
+  LEFT JOIN campaign_first_date cfd
+    ON acd.campaign_id = cfd.campaign_id
+  LEFT JOIN campaign_metadata cm
+    ON acd.campaign_id = cm.campaign_id
+  LEFT JOIN advertising_performance ap
+    ON acd.campaign_id = TRIM(CAST(ap.campaign_id AS STRING))
+    AND acd.report_date = ap.ad_date
+  LEFT JOIN aggregated_orders_by_date ao
+    ON acd.campaign_id = TRIM(CAST(ao.campaign_id AS STRING))
+    AND acd.report_date = ao.order_date
+  LEFT JOIN aggregated_orders_lifetime aol
+    ON acd.campaign_id = TRIM(CAST(aol.campaign_id AS STRING))
+  LEFT JOIN students_by_campaign_date scd
+    ON acd.campaign_id = scd.campaign_id
+    AND acd.report_date = scd.student_date
+  LEFT JOIN students_lifetime slt
+    ON acd.campaign_id = slt.campaign_id
+)
+
+-- Final output
+SELECT
+  ad_date,
+  campaign_id,
+  platform_display_name AS platform,
+  campaign_name,
+  spend,
+  impressions,
+  clicks,
+  ctr,
+  trials,
+  students,
+  customer_emails,
+  CASE WHEN new_customers > 0 THEN spend / new_customers ELSE 0 END AS cpl,
+  attributed_orders AS orders,
+  attributed_revenue AS revenue,
+  cpc,
+  CASE WHEN clicks > 0 THEN students / clicks ELSE 0 END AS cvr,
+  cac,
+  roas,
+  cost_per_trial,
+  cost_per_student,
+  student_lifetime_total
+FROM final;
