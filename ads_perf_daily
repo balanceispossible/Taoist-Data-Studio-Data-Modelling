@@ -1,0 +1,66 @@
+-- =============================================================================
+-- Unified Advertising Performance Daily View
+-- =============================================================================
+-- Purpose: Combined Google Ads + Meta Ads with identical schema (ID-based only)
+-- Output: GLS_Test.ads_perf_daily
+-- Dependencies: GLS_Test.ads_google_ad_daily, GLS_Test.ads_meta_ad_daily
+-- =============================================================================
+
+CREATE OR REPLACE VIEW `taoist-data-studio.GLS_Test.ads_perf_daily` AS
+
+-- Combine both platforms with identical schema
+SELECT
+  platform,
+  platform_display_name,
+  campaign_id,
+  campaign_name,
+  ad_id,
+  ad_name,
+  ad_date,
+  impressions,
+  clicks,
+  spend,
+  conversions,
+  conversion_value,
+  utm_campaign,
+  utm_source,
+  utm_medium,
+  utm_content,
+  ctr,
+  cpc,
+  cpm,
+  year_month,
+  year_week,
+  click_volume_tier,
+  cpc_efficiency_tier,
+  recency_bucket
+FROM `taoist-data-studio.GLS_Test.ads_google_ad_daily`
+
+UNION ALL
+
+SELECT
+  platform,
+  platform_display_name,
+  campaign_id,
+  campaign_name,
+  ad_id,
+  ad_name,
+  ad_date,
+  impressions,
+  clicks,
+  spend,
+  conversions,
+  conversion_value,
+  utm_campaign,
+  utm_source,
+  utm_medium,
+  utm_content,
+  ctr,
+  cpc,
+  cpm,
+  year_month,
+  year_week,
+  click_volume_tier,
+  cpc_efficiency_tier,
+  recency_bucket
+FROM `taoist-data-studio.GLS_Test.ads_meta_ad_daily`;
