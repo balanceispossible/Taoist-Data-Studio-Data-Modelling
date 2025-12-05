@@ -1,0 +1,115 @@
+-- View: samcart_fct_funnel_charges
+-- Purpose: Charge-level records for New Student and Recurring Student charges
+-- Use Case: Count charges from New Students and Recurring Students in a date range
+-- Granularity: 1 row per charge (not per subscription)
+-- Includes: Trial-Based AND Paid Starter subscriptions
+-- Filter by: charge_date for date range filtering
+
+CREATE OR REPLACE VIEW `taoist-data-studio.GLS_Test.samcart_fct_funnel_charges` AS
+
+WITH
+  -- Get New Students and Recurring Students from funnel_events (includes Trial-Based + Paid Starters)
+  subscription_charges_source AS (
+    SELECT
+      SAFE_CAST(subscription_id AS INT64) AS subscription_id,
+      customer_id,
+      customer_email,
+      plan_tenure,
+      product_name,
+      processor_name,
+      is_new_student_charge,
+      is_recurring_charge,
+      is_trial_start,
+      is_paid_starter,
+      total_charges,
+      customer_status,
+      record_type
+    FROM `taoist-data-studio.GLS_Test.samcart_fct_funnel_events_V3`
+    WHERE (is_new_student_charge = 1 OR is_recurring_charge = 1)
+      AND record_type = 'subscription'
+  ),
+
+  -- Calculate charge sequence first
+  charges_with_sequence AS (
+    SELECT
+      c.id AS charge_id,
+      c.subscription_rebill_id AS subscription_id,
+      c.customer_id,
+      c.created_at AS charge_timestamp,
+      DATE(c.created_at) AS charge_date,
+      c.total AS charge_amount,
+      c.processor_name AS charge_processor_name,
+      c.currency,
+      c.processor_transaction_id,
+      ROW_NUMBER() OVER (
+        PARTITION BY c.subscription_rebill_id 
+        ORDER BY c.created_at ASC
+      ) AS charge_sequence
+    FROM `taoist-data-studio.samcart_raw.charges` c
+    WHERE c.total > 0
+      AND c.subscription_rebill_id IS NOT NULL
+      AND (c.test_mode IS NULL OR c.test_mode = FALSE)
+  )
+
+-- Join charges with subscriptions and identify charge type
+SELECT
+  cws.charge_id,
+  cws.subscription_id,
+  cws.customer_id,
+  cws.charge_timestamp,
+  cws.charge_date,
+  cws.charge_amount,
+  cws.charge_processor_name,
+  cws.currency,
+  cws.processor_transaction_id,
+  cws.charge_sequence,
+  
+  -- Funnel flags from subscription
+  fe.plan_tenure,  -- Monthly or Annual (for breakdown)
+  fe.product_name,
+  fe.customer_email,
+  fe.is_new_student_charge,
+  fe.is_recurring_charge,
+  fe.is_trial_start,
+  fe.is_paid_starter,
+  fe.total_charges,
+  fe.customer_status,
+  fe.record_type,  -- Should always be 'subscription'
+  
+  -- Charge Type: Identify if this is a New Student charge or Recurring Student charge
+  CASE
+    WHEN fe.is_new_student_charge = 1 AND cws.charge_sequence = 1 THEN 'New Student Charge'
+    WHEN fe.is_recurring_charge = 1 THEN 'Recurring Student Charge'
+    ELSE 'Other'
+  END AS charge_type,
+  
+  -- Subscription Type: Trial-Based or Paid Starter
+  CASE
+    WHEN fe.is_trial_start = 1 THEN 'Trial-Based'
+    WHEN fe.is_paid_starter = 1 THEN 'Paid Starter'
+    ELSE 'Other'
+  END AS subscription_type,
+  
+  -- Cohort month (from charge date)
+  FORMAT_DATE('%Y-%m', cws.charge_date) AS charge_month,
+  
+  -- ADDED: Subscription created date (aligns with funnel_events.created_date for CVR calculations)
+  DATE(sub.created_at) AS subscription_created_date,
+  -- ADDED: Subscription cohort month (aligns with funnel_events.cohort_month)
+  FORMAT_DATE('%Y-%m', DATE(sub.created_at)) AS subscription_cohort_month
+
+FROM charges_with_sequence cws
+INNER JOIN subscription_charges_source fe
+  ON cws.subscription_id = fe.subscription_id
+-- ADDED: Join to subscriptions to get created_at (for alignment with funnel_events)
+LEFT JOIN `taoist-data-studio.samcart_raw.subscriptions` sub
+  ON cws.subscription_id = sub.id
+WHERE 
+  -- For New Students: Only include their 1st charge
+  -- For Recurring Students: Include all charges
+  (
+    (fe.is_new_student_charge = 1 AND cws.charge_sequence = 1)
+    OR
+    fe.is_recurring_charge = 1
+  );
+
