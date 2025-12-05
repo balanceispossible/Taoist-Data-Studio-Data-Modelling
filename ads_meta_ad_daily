@@ -1,0 +1,91 @@
+-- =============================================================================
+-- Meta/Facebook Ads Daily Performance View
+-- =============================================================================
+-- Purpose: Ad-level Meta Ads performance metrics using ONLY numeric IDs
+-- Output: GLS_Test.ads_meta_ad_daily
+-- Dependencies: facebook_ads_prod tables
+-- =============================================================================
+
+CREATE OR REPLACE VIEW `taoist-data-studio.GLS_Test.ads_meta_ad_daily` AS
+
+WITH base_data AS (
+  SELECT
+    -- Platform identifiers
+    'meta_ads' AS platform,
+    'Facebook' AS platform_display_name,
+    
+    -- Campaign and Ad identifiers (ID-based only)
+    CAST(a.campaign_id AS STRING) AS campaign_id,
+    a.campaign_name,
+    CAST(i.ad_id AS STRING) AS ad_id,
+    a.ad_name,
+    
+    -- Date
+    i.date AS ad_date,
+    
+    -- Performance metrics (aggregate across device/platform breakdown)
+    -- ad_device_platform_insights has multiple rows per ad per date (one per device/platform)
+    -- So we need to SUM to get total per ad per date
+    SUM(COALESCE(i.impressions, 0)) AS impressions,
+    SUM(COALESCE(i.clicks, 0)) AS clicks,
+    SUM(COALESCE(i.spend, 0)) AS spend,
+    0.0 AS conversions,  -- Meta conversions tracked separately
+    0.0 AS conversion_value,
+    
+    -- UTM parameters (ID-based matching to Samcart)
+    CAST(a.campaign_id AS STRING) AS utm_campaign,  -- Matches Samcart utm_parameters.campaign
+    'facebook' AS utm_source,
+    'cpc' AS utm_medium,
+    CAST(i.ad_id AS STRING) AS utm_content  -- Matches Samcart utm_parameters.content
+    
+  FROM `taoist-data-studio.facebook_ads_prod.ad_device_platform_insights_act_940588709686807` i
+  INNER JOIN `taoist-data-studio.facebook_ads_prod.ad_dimensions_act_940588709686807` a
+    ON i.ad_id = a.ad_id AND i.date = a.date
+  WHERE i.date IS NOT NULL
+    AND a.campaign_id IS NOT NULL  -- Filter out ads with no campaign mapping
+    AND a.campaign_name IS NOT NULL
+  GROUP BY
+    a.campaign_id,
+    a.campaign_name,
+    i.ad_id,
+    a.ad_name,
+    i.date
+)
+
+-- Add calculated metrics
+SELECT
+  *,
+  
+  -- Calculated metrics
+  CASE WHEN impressions > 0 THEN clicks / impressions ELSE 0 END AS ctr,
+  CASE WHEN clicks > 0 THEN spend / clicks ELSE 0 END AS cpc,
+  CASE WHEN impressions > 0 THEN spend / impressions * 1000 ELSE 0 END AS cpm,
+  
+  -- Helper fields for analysis
+  FORMAT_DATE('%Y-%m', ad_date) AS year_month,
+  FORMAT_DATE('%Y-W%V', ad_date) AS year_week,
+  
+  -- Performance classification tiers
+  CASE
+    WHEN clicks >= 100 THEN 'High Volume (100+ clicks)'
+    WHEN clicks >= 50 THEN 'Medium Volume (50-99 clicks)'
+    WHEN clicks >= 10 THEN 'Low Volume (10-49 clicks)'
+    ELSE 'Minimal Volume (<10 clicks)'
+  END AS click_volume_tier,
+  
+  CASE
+    WHEN clicks > 0 AND (spend / clicks) <= 0.50 THEN 'Excellent CPC (<$0.50)'
+    WHEN clicks > 0 AND (spend / clicks) <= 1.00 THEN 'Good CPC ($0.50-$1.00)'
+    WHEN clicks > 0 AND (spend / clicks) <= 2.00 THEN 'Fair CPC ($1.00-$2.00)'
+    WHEN clicks > 0 THEN 'Poor CPC (>$2.00)'
+    ELSE 'No Clicks'
+  END AS cpc_efficiency_tier,
+  
+  CASE
+    WHEN DATE_DIFF(CURRENT_DATE(), ad_date, DAY) <= 7 THEN 'Last 7 Days'
+    WHEN DATE_DIFF(CURRENT_DATE(), ad_date, DAY) <= 30 THEN 'Last 30 Days'
+    WHEN DATE_DIFF(CURRENT_DATE(), ad_date, DAY) <= 90 THEN 'Last 90 Days'
+    ELSE 'Older than 90 Days'
+  END AS recency_bucket
+  
+FROM base_data;
