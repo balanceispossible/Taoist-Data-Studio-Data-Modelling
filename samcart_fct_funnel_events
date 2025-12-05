@@ -1,0 +1,348 @@
+CREATE OR REPLACE VIEW `taoist-data-studio.GLS_Test.samcart_fct_funnel_events` AS
+
+WITH
+  -- 1. Customer Details
+  samcart_customer_details AS (
+    SELECT
+      id AS customer_id,
+      email AS customer_email
+    FROM
+      `taoist-data-studio.samcart_raw.customers`
+  ),
+
+  -- 2. Subscription Events with Plan Details
+  samcart_subscription_events AS (
+    SELECT
+      s.id AS subscription_id,
+      s.customer_id,
+      s.created_at AS event_timestamp,
+      DATE(s.created_at) AS created_date,
+      p.plan_frequency AS plan_frequency,
+      p.rebill_days,
+      p.trial_period,
+      s.product_name,
+      s.order_id,
+      s.initial_price,
+      s.recurring_price,
+      s.status AS subscription_status,
+      s.next_rebilling_date,
+      s.processor_name AS subscription_processor_name,
+      CASE
+        -- Case-insensitive matching for plan_frequency (primary method)
+        WHEN UPPER(COALESCE(p.plan_frequency, '')) IN ('ANNUAL', 'YEARLY') THEN 'Annual'
+        WHEN UPPER(COALESCE(p.plan_frequency, '')) = 'MONTHLY' THEN 'Monthly'
+        -- Fallback to rebill_days if plan_frequency is NULL or doesn't match
+        WHEN p.rebill_days = 365 OR p.rebill_days = 366 THEN 'Annual'
+        WHEN p.rebill_days = 30 OR p.rebill_days = 31 THEN 'Monthly'
+        WHEN p.rebill_days BETWEEN 28 AND 31 THEN 'Monthly'  -- Handle month variations
+        WHEN p.rebill_days BETWEEN 360 AND 366 THEN 'Annual'  -- Handle year variations
+        ELSE 'Other'  -- Includes Custom, one-off, and unknown plans
+      END AS plan_tenure,
+      -- Trial Start: initial_price = 0, status is active, AND has 7-day trial period
+      -- Aligns with README: "Trial = is on a 7 day trial"
+      CASE
+        WHEN s.initial_price.total = 0 
+          AND s.status = 'active'
+          AND COALESCE(p.trial_period, 0) = 7  -- Validate 7-day trial period
+        THEN 1
+        ELSE 0
+      END AS is_trial_start,
+      -- Paid Starter: initial_price > 0 (no trial, paid upfront)
+      CASE
+        WHEN s.initial_price.total > 0 AND s.recurring_price.total > 0 THEN 1
+        ELSE 0
+      END AS is_paid_starter
+    FROM
+      `taoist-data-studio.samcart_raw.subscriptions` AS s
+    LEFT JOIN (
+      SELECT 
+        product_id, 
+        plan_frequency, 
+        rebill_days,
+        trial_period
+      FROM `taoist-data-studio.samcart_raw.plans`
+      WHERE plan_status = 'active'
+      GROUP BY product_id, plan_frequency, rebill_days, trial_period
+    ) AS p
+    ON s.product_id = p.product_id
+    WHERE s.type IN ('recurring_subscription', 'limited_subscription')
+  ),
+
+  -- 3. Paid Charges (only subscription-related charges)
+  samcart_paid_charges AS (
+    SELECT
+      charge.subscription_rebill_id AS subscription_id,
+      charge.customer_id,
+      charge.created_at AS charge_timestamp,
+      DATE(charge.created_at) AS charge_date,
+      charge.total,
+      charge.processor_name,
+      ROW_NUMBER() OVER (PARTITION BY charge.subscription_rebill_id ORDER BY charge.created_at ASC) AS charge_sequence
+    FROM
+      `taoist-data-studio.samcart_raw.charges` AS charge
+    WHERE charge.total > 0
+      AND charge.subscription_rebill_id IS NOT NULL
+      AND (charge.test_mode IS NULL OR charge.test_mode = FALSE)
+  ),
+
+  -- 3a. Charge Aggregations per Subscription
+  subscription_charge_summary AS (
+    SELECT
+      subscription_id,
+      COUNT(*) AS total_charges,
+      MIN(charge_date) AS first_charge_date,
+      MAX(charge_date) AS last_charge_date,
+      MAX(processor_name) AS processor_name  -- Take most recent processor
+    FROM samcart_paid_charges
+    GROUP BY subscription_id
+  ),
+
+  -- 4. Failed Charges
+  samcart_failed_charges AS (
+    SELECT
+      failed.subscription_rebill_id AS subscription_id,
+      failed.customer_id,
+      failed.created_at AS failed_timestamp,
+      DATE(failed.created_at) AS failed_date,
+      failed.total
+    FROM
+      `taoist-data-studio.samcart_raw.failed_charges` AS failed
+  ),
+
+  -- 5. Refunds (linked via charge_id)
+  samcart_refunds AS (
+    SELECT
+      refund.charge_id AS charge_id,
+      charge.subscription_rebill_id AS subscription_id,
+      charge.customer_id,
+      refund.created_at AS refund_timestamp,
+      DATE(refund.created_at) AS refund_date,
+      refund.refund_amount
+    FROM
+      `taoist-data-studio.samcart_raw.refunds` AS refund
+    LEFT JOIN `taoist-data-studio.samcart_raw.charges` AS charge
+      ON refund.charge_id = charge.id
+    WHERE (charge.test_mode IS NULL OR charge.test_mode = FALSE)
+      AND charge.subscription_rebill_id IS NOT NULL
+  ),
+
+  -- 6. Churned Subscriptions
+  churned_subscriptions AS (
+    SELECT
+      s.id AS subscription_id,
+      s.customer_id,
+      s.status
+    FROM
+      `taoist-data-studio.samcart_raw.subscriptions` AS s
+    WHERE s.status IN ('cancelled', 'expired')
+  ),
+
+  -- 6a. One-Off Charges (charges without subscription_rebill_id)
+  one_off_charges AS (
+    SELECT
+      charge.id AS charge_id,
+      charge.customer_id,
+      charge.created_at AS charge_timestamp,
+      DATE(charge.created_at) AS charge_date,
+      charge.total,
+      charge.processor_name,
+      charge.order_id,
+      -- Get product name from orders
+      (SELECT product_name FROM UNNEST(orders.cart_items) LIMIT 1) AS product_name
+    FROM
+      `taoist-data-studio.samcart_raw.charges` AS charge
+    LEFT JOIN `taoist-data-studio.samcart_raw.orders` AS orders
+      ON charge.order_id = orders.id
+    WHERE charge.subscription_rebill_id IS NULL
+      AND charge.total > 0
+      AND (charge.test_mode IS NULL OR charge.test_mode = FALSE)
+  ),
+
+  -- 7. Subscription Funnel Events - Core Logic
+  subscription_funnel_events AS (
+    SELECT
+      CAST(sub.subscription_id AS STRING) AS subscription_id,  -- Cast to STRING for UNION compatibility
+      sub.customer_id,
+      cust.customer_email,
+      sub.event_timestamp,
+      sub.created_date,
+      sub.product_name,
+      sub.plan_tenure,
+      COALESCE(scs.processor_name, sub.subscription_processor_name) AS processor_name,
+      sub.is_trial_start,
+      sub.is_paid_starter,
+      
+      -- Charge Summary
+      COALESCE(scs.total_charges, 0) AS total_charges,
+      scs.first_charge_date,
+      scs.last_charge_date,
+      
+      -- New Student: Has exactly 1 paid charge (Trial-Based OR Paid Starter)
+      -- Trial-Based: Started with 7-day trial AND finished trial AND has exactly 1 charge
+      -- Paid Starter: Paid upfront from day 1 AND has exactly 1 charge
+      CASE
+        WHEN COALESCE(scs.total_charges, 0) = 1  -- Exactly 1 charge (first charge only)
+          AND (
+            (sub.is_trial_start = 1 AND scs.first_charge_date >= DATE_ADD(sub.created_date, INTERVAL 7 DAY))  -- Trial-based: 7-day trial finished (charge on day 7 or later)
+            OR
+            sub.is_paid_starter = 1  -- Paid Starter: paid upfront
+          )
+        THEN 1
+        ELSE 0
+      END AS is_new_student_charge,
+      
+      -- Recurring Student: Has more than 1 paid charge (Trial-Based OR Paid Starter)
+      -- Trial-Based: Started with trial AND has more than 1 charge
+      -- Paid Starter: Paid upfront AND has more than 1 charge
+      CASE
+        WHEN COALESCE(scs.total_charges, 0) > 1  -- More than 1 charge
+          AND (sub.is_trial_start = 1 OR sub.is_paid_starter = 1)  -- Trial-Based OR Paid Starter
+        THEN 1
+        ELSE 0
+      END AS is_recurring_charge,
+      
+      -- Active Recurring Subscriber (Industry Standard): Active subscription with recurring billing
+      -- This includes ALL active recurring subscriptions (trial-based + paid starters)
+      -- Matches industry standard for MRR, churn, retention metrics
+      CASE
+        WHEN sub.subscription_status = 'active'
+          AND sub.plan_tenure IN ('Annual', 'Monthly')  -- Recurring billing
+          AND COALESCE(scs.total_charges, 0) > 1  -- Has more than 1 charge (recurring)
+        THEN 1
+        ELSE 0
+      END AS is_active_recurring_subscriber,
+      
+      -- Churned Student
+      CASE
+        WHEN churn.subscription_id IS NOT NULL THEN 1
+        ELSE 0
+      END AS is_churned_student,
+      
+      -- Failed Trial: Started with trial AND has failed charges
+      CASE
+        WHEN sub.is_trial_start = 1 
+          AND EXISTS (
+            SELECT 1 FROM samcart_failed_charges fc
+            WHERE fc.subscription_id = sub.subscription_id
+          ) 
+        THEN 1
+        ELSE 0
+      END AS is_failed_trial,
+      
+      -- Failed Recurring Charge: Not a trial start AND has failed charges
+      CASE
+        WHEN sub.is_trial_start = 0 
+          AND EXISTS (
+            SELECT 1 FROM samcart_failed_charges fc
+            WHERE fc.subscription_id = sub.subscription_id
+          ) 
+        THEN 1
+        ELSE 0
+      END AS is_failed_recurring_charge,
+      
+      -- Refunded
+      CASE
+        WHEN EXISTS (
+          SELECT 1 FROM samcart_refunds rf
+          WHERE rf.subscription_id = sub.subscription_id
+        ) THEN 1
+        ELSE 0
+      END AS is_refunded,
+      
+      -- Cohort Month
+      FORMAT_DATE('%Y-%m', sub.created_date) AS cohort_month,
+      
+      -- Record Type
+      'subscription' AS record_type
+      
+    FROM
+      samcart_subscription_events sub
+      LEFT JOIN samcart_customer_details cust ON sub.customer_id = cust.customer_id
+      LEFT JOIN subscription_charge_summary scs ON sub.subscription_id = scs.subscription_id
+      LEFT JOIN churned_subscriptions churn ON sub.subscription_id = churn.subscription_id
+  ),
+
+  -- 8. One-Off Funnel Events
+  one_off_funnel_events AS (
+    SELECT
+      CAST(oo.charge_id AS STRING) AS subscription_id,  -- Use charge_id as identifier
+      oo.customer_id,
+      cust.customer_email,
+      oo.charge_timestamp AS event_timestamp,
+      oo.charge_date AS created_date,
+      oo.product_name,
+      'Other' AS plan_tenure,  -- One-offs are always 'Other'
+      oo.processor_name,
+      0 AS is_trial_start,  -- One-offs don't have trials
+      0 AS is_paid_starter,  -- One-offs are separate category
+      1 AS total_charges,  -- One-offs always have exactly 1 charge
+      oo.charge_date AS first_charge_date,
+      oo.charge_date AS last_charge_date,
+      0 AS is_new_student_charge,
+      0 AS is_recurring_charge,
+      0 AS is_active_recurring_subscriber,  -- One-offs are not recurring
+      0 AS is_churned_student,
+      0 AS is_failed_trial,
+      0 AS is_failed_recurring_charge,
+      0 AS is_refunded,
+      FORMAT_DATE('%Y-%m', oo.charge_date) AS cohort_month,
+      'one_off' AS record_type
+    FROM
+      one_off_charges oo
+      LEFT JOIN samcart_customer_details cust ON oo.customer_id = cust.customer_id
+  ),
+
+  -- 9. Combined Funnel Events
+  funnel_events AS (
+    SELECT * FROM subscription_funnel_events
+    UNION ALL
+    SELECT * FROM one_off_funnel_events
+  )
+
+-- Final Output with Customer Status
+SELECT
+  subscription_id,
+  customer_id,
+  customer_email,
+  event_timestamp,
+  created_date,
+  product_name,
+  plan_tenure,
+  processor_name,
+  is_trial_start,
+  is_paid_starter,
+  total_charges,
+  first_charge_date,
+  last_charge_date,
+  is_new_student_charge,
+  is_recurring_charge,
+  is_active_recurring_subscriber,
+  is_churned_student,
+  is_failed_trial,
+  is_failed_recurring_charge,
+  is_refunded,
+  cohort_month,
+  
+  -- Customer Status: Priority order matters!
+  -- 1. Recurring (trial + >1 charge) - highest priority
+  -- 2. New Student (trial + exactly 1 charge)
+  -- 3. Trial Student (trial + no charges yet)
+  -- 4. Paid Starter (paid upfront, no trial) - check before churned
+  -- 5. Churned
+  -- 6. Failed states
+  -- 7. Refunded
+  CASE
+    WHEN record_type = 'one_off' THEN 'One-Off Purchase'  -- One-offs are separate
+    WHEN is_recurring_charge = 1 THEN 'Recurring Student'
+    WHEN is_new_student_charge = 1 THEN 'New Student'
+    WHEN is_trial_start = 1 AND total_charges = 0 THEN 'Trial Student'
+    WHEN is_paid_starter = 1 THEN 'Paid Starter'  -- Paid Starters with multiple charges stay as Paid Starter
+    WHEN is_churned_student = 1 THEN 'Churned Student'
+    WHEN is_failed_trial = 1 THEN 'Failed Trial'
+    WHEN is_failed_recurring_charge = 1 THEN 'Failed Recurring Charge'
+    WHEN is_refunded = 1 THEN 'Refunded'
+    ELSE 'Other'
+  END AS customer_status,
+  record_type
+FROM
+  funnel_events
