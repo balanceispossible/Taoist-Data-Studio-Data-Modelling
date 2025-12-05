@@ -1,0 +1,97 @@
+-- =============================================================================
+-- Google Ads Daily Performance View
+-- =============================================================================
+-- Purpose: Campaign-level Google Ads performance metrics using ONLY numeric IDs
+-- Output: GLS_Test.ads_google_ad_daily
+-- Dependencies: google_ads.CampaignStats
+-- =============================================================================
+
+CREATE OR REPLACE VIEW `taoist-data-studio.GLS_Test.ads_google_ad_daily` AS
+
+WITH 
+-- Get unique campaign names to avoid join multiplication
+campaign_names AS (
+  SELECT DISTINCT
+    campaign_id,
+    campaign_name
+  FROM `taoist-data-studio.google_ads.ads_Campaign_4189852833`
+  WHERE campaign_name IS NOT NULL
+),
+
+-- Aggregate stats properly at campaign+date level
+campaign_stats AS (
+  SELECT
+    campaign_id,
+    segments_date,
+    SUM(metrics_impressions) AS impressions,
+    SUM(metrics_clicks) AS clicks,
+    SUM(metrics_cost_micros) / 1000000.0 AS spend,
+    SUM(metrics_conversions) AS conversions,
+    SUM(metrics_conversions_value) AS conversion_value
+  FROM `taoist-data-studio.google_ads.ads_CampaignStats_4189852833`
+  WHERE segments_date IS NOT NULL
+  GROUP BY campaign_id, segments_date
+)
+
+SELECT
+  -- Platform identifiers
+  'google_ads' AS platform,
+  'Google Ads' AS platform_display_name,
+  
+  -- Campaign identifiers (ID-based only)
+  CAST(s.campaign_id AS STRING) AS campaign_id,
+  c.campaign_name,
+  CAST(NULL AS STRING) AS ad_id,
+  CAST(NULL AS STRING) AS ad_name,
+  
+  -- Date
+  s.segments_date AS ad_date,
+  
+  -- Performance metrics
+  s.impressions,
+  s.clicks,
+  s.spend,
+  s.conversions,
+  s.conversion_value,
+  
+  -- UTM parameters (ID-based matching to Samcart)
+  CAST(s.campaign_id AS STRING) AS utm_campaign,
+  'google' AS utm_source,
+  'cpc' AS utm_medium,
+  CAST(NULL AS STRING) AS utm_content,
+  
+  -- Calculated metrics
+  CASE WHEN s.impressions > 0 THEN s.clicks / s.impressions ELSE 0 END AS ctr,
+  CASE WHEN s.clicks > 0 THEN s.spend / s.clicks ELSE 0 END AS cpc,
+  CASE WHEN s.impressions > 0 THEN s.spend / s.impressions * 1000 ELSE 0 END AS cpm,
+  
+  -- Helper fields for analysis
+  FORMAT_DATE('%Y-%m', s.segments_date) AS year_month,
+  FORMAT_DATE('%Y-W%V', s.segments_date) AS year_week,
+  
+  -- Performance classification tiers
+  CASE
+    WHEN s.clicks >= 100 THEN 'High Volume (100+ clicks)'
+    WHEN s.clicks >= 50 THEN 'Medium Volume (50-99 clicks)'
+    WHEN s.clicks >= 10 THEN 'Low Volume (10-49 clicks)'
+    ELSE 'Minimal Volume (<10 clicks)'
+  END AS click_volume_tier,
+  
+  CASE
+    WHEN s.clicks > 0 AND (s.spend / s.clicks) <= 0.50 THEN 'Excellent CPC (<$0.50)'
+    WHEN s.clicks > 0 AND (s.spend / s.clicks) <= 1.00 THEN 'Good CPC ($0.50-$1.00)'
+    WHEN s.clicks > 0 AND (s.spend / s.clicks) <= 2.00 THEN 'Fair CPC ($1.00-$2.00)'
+    WHEN s.clicks > 0 THEN 'Poor CPC (>$2.00)'
+    ELSE 'No Clicks'
+  END AS cpc_efficiency_tier,
+  
+  CASE
+    WHEN DATE_DIFF(CURRENT_DATE(), s.segments_date, DAY) <= 7 THEN 'Last 7 Days'
+    WHEN DATE_DIFF(CURRENT_DATE(), s.segments_date, DAY) <= 30 THEN 'Last 30 Days'
+    WHEN DATE_DIFF(CURRENT_DATE(), s.segments_date, DAY) <= 90 THEN 'Last 90 Days'
+    ELSE 'Older than 90 Days'
+  END AS recency_bucket
+  
+FROM campaign_stats s
+LEFT JOIN campaign_names c
+  ON s.campaign_id = c.campaign_id;
