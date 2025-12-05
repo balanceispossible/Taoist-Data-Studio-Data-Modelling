@@ -1,0 +1,44 @@
+-- =============================================================================
+-- Product Sales (Simplified - 4 Columns Only)
+-- =============================================================================
+-- Purpose: Simple product sales summary
+-- Output: GLS_Test.ads_product_sales
+-- Dependencies: samcart_raw.orders
+-- =============================================================================
+
+CREATE OR REPLACE VIEW `taoist-data-studio.GLS_Test.ads_product_sales` AS
+
+WITH product_orders AS (
+  SELECT
+    o.id AS order_id,
+    o.order_date,
+    item.product_name,
+    item.pricing_type,
+    -- Extract price from the nested recurring_price structure only
+    COALESCE(item.recurring_price.total, 0) / 100.0 AS product_price
+  FROM `taoist-data-studio.samcart_raw.orders` o,
+  UNNEST(o.cart_items) AS item
+  WHERE o.test_mode = FALSE
+    AND o.total > 0
+)
+
+SELECT
+  -- Date dimension
+  DATE(order_date) AS order_date,
+  FORMAT_DATE('%Y-%m', order_date) AS year_month,
+  
+  -- Product name
+  product_name,
+  
+  -- Price (average product price)
+  AVG(product_price) AS price,
+  
+  -- Orders (count of orders containing this product)
+  COUNT(DISTINCT order_id) AS orders,
+  
+  -- Revenue (sum of product prices across all orders)
+  SUM(product_price) AS revenue
+
+FROM product_orders
+GROUP BY order_date, year_month, product_name
+ORDER BY order_date DESC, revenue DESC;
